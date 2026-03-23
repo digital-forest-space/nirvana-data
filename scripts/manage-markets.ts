@@ -6,7 +6,6 @@
  * Usage: npm run markets
  */
 
-import { createInterface } from 'readline';
 import { config } from 'dotenv';
 import { createClient } from '@libsql/client';
 import { drizzle } from 'drizzle-orm/libsql';
@@ -18,6 +17,7 @@ import {
   getProgramDerivedAddress,
 } from '@solana/kit';
 import bs58 from 'bs58';
+import { select, checkbox, confirm } from '@inquirer/prompts';
 
 // Load .env.local
 config({ path: '.env.local' });
@@ -27,12 +27,6 @@ const client = createClient({
   authToken: process.env.TURSO_AUTH_TOKEN,
 });
 const db = drizzle(client);
-
-const rl = createInterface({ input: process.stdin, output: process.stdout });
-
-function ask(prompt: string): Promise<string> {
-  return new Promise((resolve) => rl.question(prompt, resolve));
-}
 
 // ── Constants ──
 
@@ -123,12 +117,17 @@ interface DiscoveredMarket {
 async function discoverMarkets(): Promise<DiscoveredMarket[]> {
   console.log('\n  Discovering markets on-chain...');
 
-  // 1. Fetch all MarketLinear accounts (304 bytes) from Mayflower
-  console.log('  Fetching MarketLinear accounts...');
   interface ProgramAccount {
     pubkey: string;
     account: { data: [string, string] };
   }
+  interface AccountResult {
+    data: [string, string];
+    lamports: number;
+  }
+
+  // 1. Fetch all MarketLinear accounts (304 bytes)
+  console.log('  Fetching MarketLinear accounts...');
   const marketLinearAccounts = await rpcCall<ProgramAccount[]>(
     'getProgramAccounts',
     [MAYFLOWER_PROGRAM, { encoding: 'base64', filters: [{ dataSize: 304 }] }]
@@ -140,7 +139,6 @@ async function discoverMarkets(): Promise<DiscoveredMarket[]> {
   }
   console.log(`  Found ${marketLinearAccounts.length} MarketLinear accounts.`);
 
-  // Extract marketMetadata pubkey (offset 8-40) from each
   const metadataAddresses: string[] = [];
   const mayflowerMarketPubkeys: string[] = [];
 
@@ -153,16 +151,11 @@ async function discoverMarkets(): Promise<DiscoveredMarket[]> {
 
   // 2. Batch-fetch MarketMeta accounts
   console.log('  Fetching MarketMeta accounts...');
-  interface AccountResult {
-    data: [string, string];
-    lamports: number;
-  }
   const metaResult = await rpcCall<{ value: (AccountResult | null)[] }>(
     'getMultipleAccounts',
     [metadataAddresses, { encoding: 'base64' }]
   );
 
-  // Parse MarketMeta fields and collect unique mints
   const mintSet = new Set<string>();
   interface ParsedMeta {
     mayflowerMarket: string;
@@ -196,12 +189,7 @@ async function discoverMarkets(): Promise<DiscoveredMarket[]> {
     parsedMetas.push({
       mayflowerMarket: mayflowerMarketPubkeys[i],
       marketMetadata: metadataAddresses[i],
-      baseMint,
-      navMint,
-      marketGroup,
-      baseVault,
-      navVault,
-      feeVault,
+      baseMint, navMint, marketGroup, baseVault, navVault, feeVault,
     });
   }
 
@@ -223,20 +211,16 @@ async function discoverMarkets(): Promise<DiscoveredMarket[]> {
   const markets: DiscoveredMarket[] = [];
 
   for (const meta of parsedMetas) {
-    // Samsara market PDA: seeds ["market", marketMeta]
     const samsaraMarket = await derivePda(SAMSARA_PROGRAM, ['market', meta.marketMetadata]);
-    // Authority PDA: seeds ["liq_vault_main", marketMeta]
     const authorityPda = await derivePda(MAYFLOWER_PROGRAM, ['liq_vault_main', meta.marketMetadata]);
 
-    // Resolve names
     const navInfo = WELL_KNOWN_MINTS[meta.navMint];
     const baseInfo = WELL_KNOWN_MINTS[meta.baseMint];
     const name = navInfo?.symbol ?? `nav_${meta.navMint.substring(0, 8)}`;
     const baseName = baseInfo?.symbol ?? meta.baseMint.substring(0, 8);
 
     markets.push({
-      name,
-      baseName,
+      name, baseName,
       baseMint: meta.baseMint,
       navMint: meta.navMint,
       samsaraMarket,
@@ -255,42 +239,37 @@ async function discoverMarkets(): Promise<DiscoveredMarket[]> {
   return markets;
 }
 
-// ── List & select ──
+// ── Actions ──
 
-async function listAndUpsert() {
+async function discoverAndUpsert() {
   const discovered = await discoverMarkets();
-  if (discovered.length === 0) return;
+  if (discovered.length === 0) {
+    console.log('  No markets found on-chain.\n');
+    return;
+  }
 
-  // Load existing DB markets for comparison
   const dbRows = await db.select().from(navMarkets);
   const dbSet = new Set(dbRows.map((r) => r.name));
 
-  console.log(`\n  Found ${discovered.length} on-chain markets:\n`);
-  for (let i = 0; i < discovered.length; i++) {
-    const m = discovered[i];
-    const inDb = dbSet.has(m.name);
-    const tag = inDb ? '\x1b[32m[in DB]\x1b[0m' : '\x1b[33m[new]  \x1b[0m';
-    console.log(`  ${(i + 1).toString().padStart(2)}. ${tag} ${m.name.padEnd(12)} base=${m.baseName}  decimals=${m.baseDecimals}/${m.navDecimals}`);
+  const selected = await checkbox({
+    message: 'Select markets to upsert',
+    choices: discovered.map((m) => {
+      const inDb = dbSet.has(m.name);
+      const tag = inDb ? '\x1b[32m[in DB]\x1b[0m' : '\x1b[33m[new]\x1b[0m';
+      return {
+        name: `${tag} ${m.name.padEnd(12)} base=${m.baseName}  decimals=${m.baseDecimals}/${m.navDecimals}`,
+        value: m,
+        checked: false,
+      };
+    }),
+  });
+
+  if (selected.length === 0) {
+    console.log('  Nothing selected.\n');
+    return;
   }
 
-  console.log('\n  Enter numbers to upsert (comma-separated, "all", or "q" to cancel)');
-  const choice = await ask('  > ');
-
-  if (choice.trim().toLowerCase() === 'q') { console.log('  Cancelled.\n'); return; }
-
-  let indices: number[];
-  if (choice.trim().toLowerCase() === 'all') {
-    indices = discovered.map((_, i) => i);
-  } else {
-    indices = choice.split(',')
-      .map((s) => parseInt(s.trim(), 10) - 1)
-      .filter((i) => !isNaN(i) && i >= 0 && i < discovered.length);
-  }
-
-  if (indices.length === 0) { console.log('  No valid selections.\n'); return; }
-
-  for (const idx of indices) {
-    const m = discovered[idx];
+  for (const m of selected) {
     await db.insert(navMarkets).values({
       name: m.name,
       enabled: true,
@@ -330,8 +309,6 @@ async function listAndUpsert() {
   console.log('');
 }
 
-// ── DB listing ──
-
 async function listDbMarkets() {
   const rows = await db.select().from(navMarkets);
   if (rows.length === 0) {
@@ -346,44 +323,42 @@ async function listDbMarkets() {
   console.log('');
 }
 
-// ── Toggle ──
-
-async function toggleMarket() {
+async function toggleMarkets() {
   const rows = await db.select().from(navMarkets);
   if (rows.length === 0) { console.log('\n  No markets to toggle.\n'); return; }
 
-  console.log('');
-  rows.forEach((m, i) => {
-    const status = m.enabled ? 'ON ' : 'OFF';
-    console.log(`  ${i + 1}. [${status}] ${m.name}`);
+  const selected = await checkbox({
+    message: 'Toggle enabled/disabled (selected = enabled)',
+    choices: rows.map((m) => ({
+      name: m.name,
+      value: m.name,
+      checked: m.enabled,
+    })),
   });
 
-  const choice = await ask('\n  Toggle which? (number): ');
-  const idx = parseInt(choice, 10) - 1;
-  if (isNaN(idx) || idx < 0 || idx >= rows.length) { console.log('  Cancelled.'); return; }
-
-  const market = rows[idx];
-  await db.update(navMarkets)
-    .set({ enabled: !market.enabled })
-    .where(eq(navMarkets.name, market.name));
-
-  console.log(`\n  ${market.name} is now ${market.enabled ? 'OFF' : 'ON'}\n`);
+  const enabledSet = new Set(selected);
+  for (const m of rows) {
+    const shouldBeEnabled = enabledSet.has(m.name);
+    if (m.enabled !== shouldBeEnabled) {
+      await db.update(navMarkets)
+        .set({ enabled: shouldBeEnabled })
+        .where(eq(navMarkets.name, m.name));
+      console.log(`  ${m.name} → ${shouldBeEnabled ? 'ON' : 'OFF'}`);
+    }
+  }
+  console.log('');
 }
-
-// ── Inspect ──
 
 async function inspectMarket() {
   const rows = await db.select().from(navMarkets);
   if (rows.length === 0) { console.log('\n  No markets.\n'); return; }
 
-  console.log('');
-  rows.forEach((m, i) => console.log(`  ${i + 1}. ${m.name}`));
+  const name = await select({
+    message: 'Inspect which market?',
+    choices: rows.map((m) => ({ name: m.name, value: m.name })),
+  });
 
-  const choice = await ask('\n  Inspect which? (number): ');
-  const idx = parseInt(choice, 10) - 1;
-  if (isNaN(idx) || idx < 0 || idx >= rows.length) { console.log('  Cancelled.'); return; }
-
-  const m = rows[idx];
+  const m = rows.find((r) => r.name === name)!;
   console.log(`
   ${m.name} ${m.enabled ? '(enabled)' : '(disabled)'}
   ─────────────────────────────────
@@ -403,25 +378,29 @@ async function inspectMarket() {
 `);
 }
 
-// ── Delete ──
-
-async function deleteMarket() {
+async function deleteMarkets() {
   const rows = await db.select().from(navMarkets);
   if (rows.length === 0) { console.log('\n  No markets to delete.\n'); return; }
 
+  const selected = await checkbox({
+    message: 'Select markets to delete',
+    choices: rows.map((m) => ({ name: m.name, value: m.name })),
+  });
+
+  if (selected.length === 0) { console.log('  Nothing selected.\n'); return; }
+
+  const yes = await confirm({
+    message: `Delete ${selected.length} market(s): ${selected.join(', ')}?`,
+    default: false,
+  });
+
+  if (!yes) { console.log('  Cancelled.\n'); return; }
+
+  for (const name of selected) {
+    await db.delete(navMarkets).where(eq(navMarkets.name, name));
+    console.log(`  Deleted ${name}`);
+  }
   console.log('');
-  rows.forEach((m, i) => console.log(`  ${i + 1}. ${m.name}`));
-
-  const choice = await ask('\n  Delete which? (number): ');
-  const idx = parseInt(choice, 10) - 1;
-  if (isNaN(idx) || idx < 0 || idx >= rows.length) { console.log('  Cancelled.'); return; }
-
-  const market = rows[idx];
-  const confirm = await ask(`  Delete ${market.name}? (y/N): `);
-  if (confirm.toLowerCase() !== 'y') { console.log('  Cancelled.'); return; }
-
-  await db.delete(navMarkets).where(eq(navMarkets.name, market.name));
-  console.log(`\n  Deleted ${market.name}\n`);
 }
 
 // ── Main loop ──
@@ -429,30 +408,30 @@ async function deleteMarket() {
 async function main() {
   console.log('\n  ╔══════════════════════════╗');
   console.log('  ║   Nav Market Manager     ║');
-  console.log('  ╚══════════════════════════╝');
+  console.log('  ╚══════════════════════════╝\n');
 
   while (true) {
-    console.log('  1. Discover on-chain markets & upsert');
-    console.log('  2. List DB markets');
-    console.log('  3. Toggle enabled/disabled');
-    console.log('  4. Inspect market');
-    console.log('  5. Delete market');
-    console.log('  q. Quit');
+    const action = await select({
+      message: 'What do you want to do?',
+      choices: [
+        { name: 'Discover on-chain markets & upsert', value: 'discover' },
+        { name: 'List DB markets', value: 'list' },
+        { name: 'Toggle enabled/disabled', value: 'toggle' },
+        { name: 'Inspect market details', value: 'inspect' },
+        { name: 'Delete markets', value: 'delete' },
+        { name: 'Quit', value: 'quit' },
+      ],
+    });
 
-    const choice = await ask('\n  > ');
-
-    switch (choice.trim()) {
-      case '1': await listAndUpsert(); break;
-      case '2': await listDbMarkets(); break;
-      case '3': await toggleMarket(); break;
-      case '4': await inspectMarket(); break;
-      case '5': await deleteMarket(); break;
-      case 'q': case 'Q':
+    switch (action) {
+      case 'discover': await discoverAndUpsert(); break;
+      case 'list': await listDbMarkets(); break;
+      case 'toggle': await toggleMarkets(); break;
+      case 'inspect': await inspectMarket(); break;
+      case 'delete': await deleteMarkets(); break;
+      case 'quit':
         console.log('  Bye!\n');
-        rl.close();
         process.exit(0);
-      default:
-        console.log('  Invalid choice.\n');
     }
   }
 }
