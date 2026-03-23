@@ -60,10 +60,10 @@ export default function PricesPage() {
               ) : (
                 <>
                   <td style={{ padding: '0.5rem 1rem', fontFamily: 'var(--font-geist-mono)' }}>
-                    {data.price.toFixed(4)}
+                    {data.price}
                   </td>
                   <td style={{ padding: '0.5rem 1rem', fontFamily: 'var(--font-geist-mono)' }}>
-                    {data.floor.toFixed(4)}
+                    {data.floor}
                   </td>
                   <td style={{ padding: '0.5rem 1rem' }}>{data.currency}</td>
                   <td style={{ padding: '0.5rem 1rem', opacity: 0.6, fontSize: '0.875rem' }}>
