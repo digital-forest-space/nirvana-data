@@ -36,6 +36,7 @@ export default function RootLayout({
           <a href="/" style={{ fontWeight: 'bold' }}>Nirvana Data</a>
           <a href="/prices">Prices</a>
           <a href="/markets">Markets</a>
+          <a href="/fees">Fees</a>
           <a href="/wallet">Wallet</a>
         </nav>
         <main style={{ padding: '2rem', fontFamily: 'var(--font-geist-sans)' }}>

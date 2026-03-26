@@ -189,80 +189,109 @@ function buildResult(cached: CachedMarketPrice): MarketPriceResult {
   };
 }
 
+// In-flight revalidation tracking to avoid duplicate background fetches
+const revalidating = new Set<string>();
+
+/**
+ * Perform the actual RPC fetch + cache update for a market.
+ * Used both synchronously (cold cache) and as a background revalidation.
+ */
+async function revalidateMarketPrice(
+  strategy: MarketPriceStrategy,
+  rpcUrl: string,
+  cached: CachedMarketPrice | null
+): Promise<MarketResult> {
+  const result = await fetchWithPaging(strategy, rpcUrl, {
+    afterSignature: cached?.checkpointSignature,
+  });
+
+  if (result.status === 'found' && result.price) {
+    const floorPrice = await strategy.fetchFloorPrice(rpcUrl);
+
+    if (!strategy.validatePrice(result.price, floorPrice)) {
+      if (cached) {
+        const updatedCache: CachedMarketPrice = {
+          ...cached,
+          floor: floorPrice,
+          checkpointSignature: result.newestCheckedSignature || cached.checkpointSignature,
+          updatedAt: new Date(),
+        };
+        await setCachedMarketPrice(updatedCache);
+        return buildResult(updatedCache);
+      }
+
+      return {
+        market: strategy.marketName,
+        error: `Parsed price ${result.price.toFixed(4)} failed validation (floor ${floorPrice.toFixed(4)})`,
+      };
+    }
+
+    const newCache: CachedMarketPrice = {
+      market: strategy.marketName,
+      price: result.price,
+      floor: floorPrice,
+      fee: result.fee,
+      currency: result.currency || strategy.currency,
+      priceSignature: result.priceSignature!,
+      checkpointSignature: result.newestCheckedSignature || result.priceSignature!,
+      updatedAt: new Date(),
+    };
+    await setCachedMarketPrice(newCache);
+    return buildResult(newCache);
+  }
+
+  if ((result.status === 'unchanged' || result.status === 'limitReached') && cached) {
+    const floorPrice = await strategy.fetchFloorPrice(rpcUrl);
+
+    const updatedCache: CachedMarketPrice = {
+      ...cached,
+      floor: floorPrice,
+      checkpointSignature: result.newestCheckedSignature || cached.checkpointSignature,
+      updatedAt: new Date(),
+    };
+    await setCachedMarketPrice(updatedCache);
+    return buildResult(updatedCache);
+  }
+
+  return {
+    market: strategy.marketName,
+    error: result.errorMessage || `Failed to fetch price for ${strategy.marketName}`,
+  };
+}
+
 /**
  * Fetch market price using the given strategy, with caching and paging.
+ *
+ * Stale-while-revalidate: if a cached price exists it is returned immediately,
+ * even if stale. A background revalidation is kicked off when the cache TTL
+ * has expired so the next caller gets fresh data.
  */
 export async function fetchMarketPrice(
   strategy: MarketPriceStrategy,
   rpcUrl: string
 ): Promise<MarketResult> {
   try {
-    // 1. Check cache
     const cached = await getCachedMarketPrice(strategy.marketName);
     const cacheAge = cached ? Date.now() - cached.updatedAt.getTime() : Infinity;
 
+    // Fresh cache — return immediately
     if (cacheAge < CACHE_TTL_MS && cached) {
       return buildResult(cached);
     }
 
-    // 2. Fetch fresh data
-    const result = await fetchWithPaging(strategy, rpcUrl, {
-      afterSignature: cached?.checkpointSignature,
-    });
-
-    // 3. Handle result
-    if (result.status === 'found' && result.price) {
-      const floorPrice = await strategy.fetchFloorPrice(rpcUrl);
-
-      if (!strategy.validatePrice(result.price, floorPrice)) {
-        if (cached) {
-          const updatedCache: CachedMarketPrice = {
-            ...cached,
-            floor: floorPrice,
-            checkpointSignature: result.newestCheckedSignature || cached.checkpointSignature,
-            updatedAt: new Date(),
-          };
-          await setCachedMarketPrice(updatedCache);
-          return buildResult(updatedCache);
-        }
-
-        return {
-          market: strategy.marketName,
-          error: `Parsed price ${result.price.toFixed(4)} failed validation (floor ${floorPrice.toFixed(4)})`,
-        };
+    // Stale cache — return it now, revalidate in background
+    if (cached) {
+      if (!revalidating.has(strategy.marketName)) {
+        revalidating.add(strategy.marketName);
+        revalidateMarketPrice(strategy, rpcUrl, cached)
+          .catch(() => {})
+          .finally(() => revalidating.delete(strategy.marketName));
       }
-
-      const newCache: CachedMarketPrice = {
-        market: strategy.marketName,
-        price: result.price,
-        floor: floorPrice,
-        fee: result.fee,
-        currency: result.currency || strategy.currency,
-        priceSignature: result.priceSignature!,
-        checkpointSignature: result.newestCheckedSignature || result.priceSignature!,
-        updatedAt: new Date(),
-      };
-      await setCachedMarketPrice(newCache);
-      return buildResult(newCache);
+      return buildResult(cached);
     }
 
-    if ((result.status === 'unchanged' || result.status === 'limitReached') && cached) {
-      const floorPrice = await strategy.fetchFloorPrice(rpcUrl);
-
-      const updatedCache: CachedMarketPrice = {
-        ...cached,
-        floor: floorPrice,
-        checkpointSignature: result.newestCheckedSignature || cached.checkpointSignature,
-        updatedAt: new Date(),
-      };
-      await setCachedMarketPrice(updatedCache);
-      return buildResult(updatedCache);
-    }
-
-    return {
-      market: strategy.marketName,
-      error: result.errorMessage || `Failed to fetch price for ${strategy.marketName}`,
-    };
+    // No cache at all — must fetch synchronously
+    return await revalidateMarketPrice(strategy, rpcUrl, null);
   } catch (error) {
     return {
       market: strategy.marketName,

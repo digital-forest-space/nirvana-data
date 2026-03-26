@@ -11,6 +11,16 @@ export const priceCache = sqliteTable('price_cache', {
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });
 
+export const feeCache = sqliteTable('fee_cache', {
+  market: text('market').primaryKey(),
+  buyFeeUbps: integer('buy_fee_ubps'),
+  sellFeeUbps: integer('sell_fee_ubps'),
+  borrowFeeUbps: integer('borrow_fee_ubps'),
+  exerciseOptionFeeUbps: integer('exercise_option_fee_ubps'),
+  sellFeeRatio: real('sell_fee_ratio'),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+});
+
 export const navMarkets = sqliteTable('nav_markets', {
   name: text('name').primaryKey(),
   enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
