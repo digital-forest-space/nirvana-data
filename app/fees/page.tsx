@@ -11,12 +11,13 @@ interface NavMarketFees {
 }
 
 interface AnaFees {
+  market: string;
   sellFeePercent: number;
 }
 
 interface FeesData {
-  ANA: AnaFees;
-  navMarkets: Record<string, NavMarketFees>;
+  ana: AnaFees;
+  navMarkets: NavMarketFees[];
   fetchedAt: string;
 }
 
@@ -53,8 +54,6 @@ export default function FeesPage() {
   if (error) return <p style={{ color: '#ef4444' }}>Error: {error}</p>;
   if (!fees) return <p>No fee data available.</p>;
 
-  const navMarkets = Object.values(fees.navMarkets);
-
   return (
     <div>
       <h1>Protocol Fees</h1>
@@ -64,13 +63,13 @@ export default function FeesPage() {
         <tbody>
           <tr style={{ borderBottom: '1px solid var(--foreground)' }}>
             <td style={headerStyle}>Sell Fee</td>
-            <td style={cellStyle}>{formatPercent(fees.ANA.sellFeePercent)}</td>
+            <td style={cellStyle}>{formatPercent(fees.ana.sellFeePercent)}</td>
           </tr>
         </tbody>
       </table>
 
       <h2 style={{ marginTop: '2rem' }}>NAV Markets</h2>
-      {navMarkets.length === 0 ? (
+      {fees.navMarkets.length === 0 ? (
         <p>No NAV market fees available.</p>
       ) : (
         <table style={{ marginTop: '0.75rem', borderCollapse: 'collapse', width: '100%', maxWidth: '800px' }}>
@@ -84,7 +83,7 @@ export default function FeesPage() {
             </tr>
           </thead>
           <tbody>
-            {navMarkets.map((m) => (
+            {fees.navMarkets.map((m) => (
               <tr key={m.market} style={{ borderBottom: '1px solid var(--foreground)' }}>
                 <td style={{ padding: '0.5rem 1rem', fontWeight: 'bold' }}>{m.market}</td>
                 <td style={cellStyle}>{formatPercent(m.buyFeePercent)}</td>

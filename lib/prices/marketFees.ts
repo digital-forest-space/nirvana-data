@@ -42,8 +42,8 @@ export interface AnaFees {
 }
 
 export interface AllFees {
-  ANA: AnaFees;
-  navMarkets: Record<string, MarketFees>;
+  ana: AnaFees;
+  navMarkets: MarketFees[];
   fetchedAt: string;
 }
 
@@ -51,14 +51,14 @@ function ubpsToPercent(ubps: number): number {
   return ubps / 10_000;
 }
 
-function parseMarketGroupFees(data: Buffer, marketName: string): MarketFees {
+function parseMarketGroupFees(data: Buffer, market: string): MarketFees {
   const buyFeeUbps = data.readUInt32LE(106);
   const sellFeeUbps = data.readUInt32LE(110);
   const borrowFeeUbps = data.readUInt32LE(114);
   const exerciseOptionFeeUbps = data.readUInt32LE(118);
 
   return {
-    market: marketName,
+    market,
     buyFeeUbps,
     sellFeeUbps,
     borrowFeeUbps,
@@ -92,7 +92,7 @@ async function getCachedFees(): Promise<CachedFeesResult | null> {
   const oldest = Math.min(...rows.map((r) => r.updatedAt.getTime()));
 
   let anaFees: AnaFees = { market: 'ANA', sellFeeRatio: 0, sellFeePercent: 0 };
-  const navFees: Record<string, MarketFees> = {};
+  const navFees: MarketFees[] = [];
 
   for (const row of rows) {
     if (row.market === 'ANA') {
@@ -103,7 +103,7 @@ async function getCachedFees(): Promise<CachedFeesResult | null> {
       const sell = row.sellFeeUbps ?? 0;
       const borrow = row.borrowFeeUbps ?? 0;
       const exercise = row.exerciseOptionFeeUbps ?? 0;
-      navFees[row.market] = {
+      navFees.push({
         market: row.market,
         buyFeeUbps: buy,
         sellFeeUbps: sell,
@@ -113,13 +113,13 @@ async function getCachedFees(): Promise<CachedFeesResult | null> {
         sellFeePercent: ubpsToPercent(sell),
         borrowFeePercent: ubpsToPercent(borrow),
         exerciseOptionFeePercent: ubpsToPercent(exercise),
-      };
+      });
     }
   }
 
   return {
     fees: {
-      ANA: anaFees,
+      ana: anaFees,
       navMarkets: navFees,
       fetchedAt: new Date(oldest).toISOString(),
     },
@@ -178,11 +178,11 @@ async function revalidateFees(): Promise<AllFees> {
   const allAddresses = [...marketGroupAddresses, TENANT_ACCOUNT];
   const accounts = await getMultipleAccounts(allAddresses, rpcUrl);
 
-  const navFees: Record<string, MarketFees> = {};
+  const navFees: MarketFees[] = [];
   for (let i = 0; i < markets.length; i++) {
     const account = accounts[i];
     if (!account || account.data.length < 122) continue;
-    navFees[markets[i].name] = parseMarketGroupFees(account.data, markets[i].name);
+    navFees.push(parseMarketGroupFees(account.data, markets[i].name));
   }
 
   const tenantAccount = accounts[accounts.length - 1];
@@ -192,12 +192,12 @@ async function revalidateFees(): Promise<AllFees> {
   }
 
   await cacheAnaFees(anaFees);
-  for (const [name, fees] of Object.entries(navFees)) {
-    await cacheMarketFees(name, fees);
+  for (const fees of navFees) {
+    await cacheMarketFees(fees.market, fees);
   }
 
   return {
-    ANA: anaFees,
+    ana: anaFees,
     navMarkets: navFees,
     fetchedAt: new Date().toISOString(),
   };
